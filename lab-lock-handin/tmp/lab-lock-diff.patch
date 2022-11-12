@@ -1,0 +1,327 @@
+diff --git a/kernel/bio.c b/kernel/bio.c
+index 60d91a6..bca06c2 100644
+--- a/kernel/bio.c
++++ b/kernel/bio.c
+@@ -23,32 +23,53 @@
+ #include "fs.h"
+ #include "buf.h"
+ 
++#define NBUCKET 13
++
+ struct {
+-  struct spinlock lock;
++  //struct spinlock lock;
+   struct buf buf[NBUF];
+ 
++  struct buf bucket[NBUCKET];
++  struct spinlock bucket_lock[NBUCKET];
++
+   // Linked list of all buffers, through prev/next.
+   // Sorted by how recently the buffer was used.
+   // head.next is most recent, head.prev is least.
+-  struct buf head;
++  //struct buf head;
+ } bcache;
+ 
++int getHash(uint i)
++{
++  return (i % NBUCKET);
++}
++
+ void
+ binit(void)
+ {
++  //printf("binit\n");
+   struct buf *b;
+ 
+-  initlock(&bcache.lock, "bcache");
++  //initlock(&bcache.lock, "bcache");
++  for(int i=0; i<NBUCKET; i++)
++  {
++    char name[10] = "bcache";
++    name[6] = i - '0';
++    name[7] = '\0';
++    initlock(&bcache.bucket_lock[i], name);
++    bcache.bucket[i].prev = &bcache.bucket[i];
++    bcache.bucket[i].next = &bcache.bucket[i];
++  }
+ 
+   // Create linked list of buffers
+-  bcache.head.prev = &bcache.head;
+-  bcache.head.next = &bcache.head;
++  //bcache.head.prev = &bcache.head;
++  //bcache.head.next = &bcache.head;
+   for(b = bcache.buf; b < bcache.buf+NBUF; b++){
+-    b->next = bcache.head.next;
+-    b->prev = &bcache.head;
++    int hash = getHash(b->blockno);
++    b->next = bcache.bucket[hash].next;
++    b->prev = &bcache.bucket[hash];
+     initsleeplock(&b->lock, "buffer");
+-    bcache.head.next->prev = b;
+-    bcache.head.next = b;
++    bcache.bucket[hash].next->prev = b;
++    bcache.bucket[hash].next = b;
+   }
+ }
+ 
+@@ -58,33 +79,54 @@ binit(void)
+ static struct buf*
+ bget(uint dev, uint blockno)
+ {
++  //printf("bget\n");
+   struct buf *b;
+-
+-  acquire(&bcache.lock);
++  int hash = getHash(blockno);
++  acquire(&bcache.bucket_lock[hash]);
+ 
+   // Is the block already cached?
+-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
++  for(b = bcache.bucket[hash].next; b != &bcache.bucket[hash]; b = b->next){
+     if(b->dev == dev && b->blockno == blockno){
++      //b->time_stamp = ticks;
+       b->refcnt++;
+-      release(&bcache.lock);
++      release(&bcache.bucket_lock[hash]);
+       acquiresleep(&b->lock);
+       return b;
+     }
+   }
+ 
+-  // Not cached.
+-  // Recycle the least recently used (LRU) unused buffer.
+-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
+-    if(b->refcnt == 0) {
+-      b->dev = dev;
+-      b->blockno = blockno;
+-      b->valid = 0;
+-      b->refcnt = 1;
+-      release(&bcache.lock);
+-      acquiresleep(&b->lock);
+-      return b;
++  //int flag = 0;
++  for(int i=getHash(blockno+1); i != hash; i = getHash(i+1))
++  {
++    if(i == hash)
++      continue;
++    acquire(&bcache.bucket_lock[i]);
++    for(b = bcache.bucket[i].prev; b != &bcache.bucket[i]; b = b->prev)
++    {
++      if(b->refcnt == 0){
++        //b->time_stamp = ticks;
++        b->dev = dev;
++        b->blockno = blockno;
++        b->refcnt++;
++        b->valid = 0;
++
++        b->prev->next = b->next;
++        b->next->prev = b->prev;
++
++        b->next = bcache.bucket[hash].next;
++        b->prev = &bcache.bucket[hash];
++        bcache.bucket[hash].next->prev = b;
++        bcache.bucket[hash].next = b;
++
++        release(&bcache.bucket_lock[hash]);
++        release(&bcache.bucket_lock[i]);
++        acquiresleep(&b->lock);
++        return b;
++      }
+     }
++    release(&bcache.bucket_lock[i]);
+   }
++
+   panic("bget: no buffers");
+ }
+ 
+@@ -92,6 +134,7 @@ bget(uint dev, uint blockno)
+ struct buf*
+ bread(uint dev, uint blockno)
+ {
++  //printf("bread\n");
+   struct buf *b;
+ 
+   b = bget(dev, blockno);
+@@ -106,6 +149,7 @@ bread(uint dev, uint blockno)
+ void
+ bwrite(struct buf *b)
+ {
++  //printf("bwrite\n");
+   if(!holdingsleep(&b->lock))
+     panic("bwrite");
+   virtio_disk_rw(b, 1);
+@@ -116,38 +160,44 @@ bwrite(struct buf *b)
+ void
+ brelse(struct buf *b)
+ {
++  //printf("brelse\n");
+   if(!holdingsleep(&b->lock))
+     panic("brelse");
+ 
+   releasesleep(&b->lock);
+ 
+-  acquire(&bcache.lock);
++  int hash = getHash(b->blockno);
++  acquire(&bcache.bucket_lock[hash]);
+   b->refcnt--;
+   if (b->refcnt == 0) {
+     // no one is waiting for it.
+     b->next->prev = b->prev;
+     b->prev->next = b->next;
+-    b->next = bcache.head.next;
+-    b->prev = &bcache.head;
+-    bcache.head.next->prev = b;
+-    bcache.head.next = b;
++    b->next = bcache.bucket[hash].next;
++    b->prev = &bcache.bucket[hash];
++    bcache.bucket[hash].next->prev = b;
++    bcache.bucket[hash].next = b;
+   }
+   
+-  release(&bcache.lock);
++  release(&bcache.bucket_lock[hash]);
+ }
+ 
+ void
+ bpin(struct buf *b) {
+-  acquire(&bcache.lock);
++  //printf("bpin\n");
++  int hash = getHash(b->blockno);
++  acquire(&bcache.bucket_lock[hash]);
+   b->refcnt++;
+-  release(&bcache.lock);
++  release(&bcache.bucket_lock[hash]);
+ }
+ 
+ void
+ bunpin(struct buf *b) {
+-  acquire(&bcache.lock);
++  //printf("bunpin\n");
++  int hash = getHash(b->blockno);
++  acquire(&bcache.bucket_lock[hash]);
+   b->refcnt--;
+-  release(&bcache.lock);
++  release(&bcache.bucket_lock[hash]);
+ }
+ 
+ 
+diff --git a/kernel/buf.h b/kernel/buf.h
+index 4616e9e..878634f 100644
+--- a/kernel/buf.h
++++ b/kernel/buf.h
+@@ -8,5 +8,6 @@ struct buf {
+   struct buf *prev; // LRU cache list
+   struct buf *next;
+   uchar data[BSIZE];
++  //int time_stamp;
+ };
+ 
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index fa6a0ac..69cc497 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -18,15 +18,31 @@ struct run {
+   struct run *next;
+ };
+ 
+-struct {
++struct kmem{
+   struct spinlock lock;
+   struct run *freelist;
+-} kmem;
++};
++
++struct kmem kmems[NCPU];
++
++int get_cpuid()
++{
++  push_off();
++  int id = cpuid();
++  pop_off();
++  return id;
++}
+ 
+ void
+ kinit()
+ {
+-  initlock(&kmem.lock, "kmem");
++  for(int i=0; i<NCPU; i++)
++  {
++    char name[10] = "kmem";
++    name[4] = i - '0';
++    name[5] = '\0';
++    initlock(&kmems[i].lock, name);
++  }
+   freerange(end, (void*)PHYSTOP);
+ }
+ 
+@@ -56,10 +72,12 @@ kfree(void *pa)
+ 
+   r = (struct run*)pa;
+ 
+-  acquire(&kmem.lock);
+-  r->next = kmem.freelist;
+-  kmem.freelist = r;
+-  release(&kmem.lock);
++  int id = get_cpuid();
++
++  acquire(&kmems[id].lock);
++  r->next = kmems[id].freelist;
++  kmems[id].freelist = r;
++  release(&kmems[id].lock);
+ }
+ 
+ // Allocate one 4096-byte page of physical memory.
+@@ -70,11 +88,47 @@ kalloc(void)
+ {
+   struct run *r;
+ 
+-  acquire(&kmem.lock);
+-  r = kmem.freelist;
++  int id = get_cpuid();
++
++  acquire(&kmems[id].lock);
++  r = kmems[id].freelist;
+   if(r)
+-    kmem.freelist = r->next;
+-  release(&kmem.lock);
++    kmems[id].freelist = r->next;
++  release(&kmems[id].lock);
++
++  int flag = 0;
++
++  if(!r)//freelist of current cpu is empty, need to STEAL!
++  {
++    for(int i=0; i<NCPU; i++)
++    {
++      if(i == id)
++        continue;
++      if(kmems[i].freelist)
++      {
++        acquire(&kmems[i].lock);
++        r = kmems[i].freelist;
++        kmems[i].freelist = r->next;
++        release(&kmems[i].lock);
++
++        acquire(&kmems[id].lock);
++        r->next = kmems[id].freelist;
++        kmems[id].freelist = r;
++        release(&kmems[id].lock);
++        flag = 1;
++        break;
++      }
++    }
++  }
++
++  if(flag)
++  {
++    acquire(&kmems[id].lock);
++    r = kmems[id].freelist;
++    if(r)
++      kmems[id].freelist = r->next;
++    release(&kmems[id].lock);
++  }
+ 
+   if(r)
+     memset((char*)r, 5, PGSIZE); // fill with junk
